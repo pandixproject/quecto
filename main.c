@@ -1,408 +1,333 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <termios.h>
 #include <unistd.h>
 
-static char *dup_string(const char *s) {
-  size_t l = strlen(s) + 1;
-  char *d = malloc(l);
-  if (d)
-    memcpy(d, s, l);
-  return d;
-}
+typedef struct {
+  char *data;
+  size_t length, capacity, cursor;
+} Buffer;
 
-static void strip_newline(char *s) {
-  size_t l = strlen(s);
-  if (l > 0 && s[l - 1] == '\n')
-    s[l - 1] = '\0';
-}
-
-static char *read_dynamic_line(FILE *fp) {
-  size_t cap = 128, len = 0;
-  int c;
-  char *buf = malloc(cap);
-  if (!buf)
-    return NULL;
-  while ((c = fgetc(fp)) != EOF) {
-    if (len + 2 >= cap) {
-      char *tmp;
-      cap *= 2;
-      tmp = realloc(buf, cap);
-      if (!tmp) {
-        free(buf);
-        return NULL;
-      }
-      buf = tmp;
-    }
-    buf[len++] = (char)c;
-    if (c == '\n')
-      break;
-  }
-  if (len == 0 && c == EOF) {
-    free(buf);
-    return NULL;
-  }
-  buf[len] = '\0';
-  return buf;
-}
-
-static void free_lines(char **lines, int count) {
-  for (int i = 0; i < count; i++)
-    free(lines[i]);
-}
-
-static int ensure_capacity(char ***lines, int *capacity, int required,
-                           int max_lines) {
-  int new_capacity;
-  char **tmp;
-  if (max_lines > 0 && required > max_lines)
-    return 0;
-  if (required <= *capacity)
+static int reserve(Buffer *b, size_t n) {
+  if (n <= b->capacity)
     return 1;
-  new_capacity = *capacity ? *capacity : 32;
-  while (new_capacity < required) {
-    if (new_capacity > INT_MAX / 2) {
-      new_capacity = required;
-      break;
+  size_t cap = b->capacity ? b->capacity : 1024;
+  while (cap < n) {
+    if (cap > (size_t)-1 / 2)
+      return 0;
+    cap *= 2;
+  }
+  char *p = realloc(b->data, cap);
+  if (!p)
+    return 0;
+  b->data = p;
+  b->capacity = cap;
+  return 1;
+}
+
+static int load_file(Buffer *b, const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return errno == ENOENT;
+  char chunk[4096];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) {
+    if (!reserve(b, b->length + n)) {
+      fclose(f);
+      return 0;
     }
-    new_capacity *= 2;
+    memcpy(b->data + b->length, chunk, n);
+    b->length += n;
   }
-  if (max_lines > 0 && new_capacity > max_lines)
-    new_capacity = max_lines;
-  tmp = realloc(*lines, (size_t)new_capacity * sizeof(*tmp));
-  if (!tmp)
-    return 0;
-  memset(tmp + *capacity, 0,
-         (size_t)(new_capacity - *capacity) * sizeof(*tmp));
-  *lines = tmp;
-  *capacity = new_capacity;
-  return 1;
-}
-
-static int parse_line_number(const char *text, int *number) {
-  char *end;
-  long value;
-  errno = 0;
-  value = strtol(text, &end, 10);
-  if (errno || end == text || *end != '\0' || value < 1 || value > INT_MAX)
-    return 0;
-  *number = (int)value;
-  return 1;
-}
-
-static int parse_range(const char *text, int *first, int *last) {
-  char *end;
-  long a, b;
-  errno = 0;
-  a = strtol(text, &end, 10);
-  if (errno || end == text || a < 1 || a > INT_MAX)
-    return 0;
-  while (*end == ' ')
-    end++;
-  if (*end == '\0') {
-    *first = *last = (int)a;
-    return 1;
-  }
-  errno = 0;
-  b = strtol(end, &end, 10);
-  if (errno || *end != '\0' || b < a || b > INT_MAX)
-    return 0;
-  *first = (int)a;
-  *last = (int)b;
-  return 1;
-}
-
-static void print_line_content(char **lines, int line_count, int line) {
-  if (line < line_count && lines[line]) {
-    size_t length = strlen(lines[line]);
-    printf("%d: %s", line + 1, lines[line]);
-    if (length == 0 || lines[line][length - 1] != '\n')
-      printf("\n");
-  } else {
-    printf("%d: (empty)\n", line + 1);
-  }
-}
-
-static void print_help(const char *prog) {
-  printf("quecto text editor\n\nUsage: %s [options] <filename>\n\n", prog);
-  printf("Options:\n  -h, --help            Show help and exit\n");
-  printf("  -v, --version         Show version information and exit\n");
-  printf("  -m, --max-lines N     Limit the file to N lines\n\nCommands:\n");
-  printf(":w save, :wq save and exit, :q exit, :q! force exit\n");
-  printf(":p [N [M]] print, :g N go to line, :f [N] go and print\n");
-  printf(":s TEXT find, :n next match, :d [N] delete, :i [N] insert\n");
-  printf(":u undo last edit, :help show this help\n");
-}
-
-static int save_file(const char *filename, char **lines, int line_count) {
-  size_t path_length = strlen(filename) + 8;
-  char *temporary = malloc(path_length);
-  struct stat status;
-  int fd;
-  FILE *file;
-  int ok = 0, failed = 0;
-  if (!temporary)
-    return 0;
-  snprintf(temporary, path_length, "%s.XXXXXX", filename);
-  fd = mkstemp(temporary);
-  if (fd < 0)
-    goto done;
-  if (stat(filename, &status) == 0)
-    fchmod(fd, status.st_mode);
-  file = fdopen(fd, "w");
-  if (!file) {
-    close(fd);
-    unlink(temporary);
-    goto done;
-  }
-  for (int i = 0; i < line_count; i++) {
-    if (lines[i] && fputs(lines[i], file) == EOF) {
-      failed = 1;
-      break;
-    }
-  }
-  if (!failed && (fflush(file) == EOF || fsync(fd) != 0))
-    failed = 1;
-  if (fclose(file) == EOF)
-    failed = 1;
-  if (failed) {
-    unlink(temporary);
-    goto done;
-  }
-  if (rename(temporary, filename) != 0) {
-    unlink(temporary);
-    goto done;
-  }
-  ok = 1;
-done:
-  free(temporary);
+  int ok = !ferror(f);
+  fclose(f);
   return ok;
 }
 
-static int copy_lines(char **source, int count, char ***copy) {
-  char **result = calloc((size_t)count, sizeof(*result));
-  if (!result && count > 0)
+static int save_file(Buffer *b, const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f)
     return 0;
-  for (int i = 0; i < count; i++) {
-    if (source[i] && !(result[i] = dup_string(source[i]))) {
-      free_lines(result, count);
-      free(result);
-      return 0;
-    }
+  int ok = fwrite(b->data, 1, b->length, f) == b->length;
+  if (fclose(f) != 0)
+    ok = 0;
+  return ok;
+}
+
+static size_t line_start(const Buffer *b, size_t at) {
+  while (at && b->data[at - 1] != '\n')
+    at--;
+  return at;
+}
+static size_t line_end(const Buffer *b, size_t at) {
+  while (at < b->length && b->data[at] != '\n')
+    at++;
+  return at;
+}
+static void move_vertical(Buffer *b, int direction, size_t *goal) {
+  size_t start = line_start(b, b->cursor), col = b->cursor - start;
+  if (*goal == (size_t)-1)
+    *goal = col;
+  if (direction < 0) {
+    if (!start)
+      return;
+    size_t prev_end = start - 1, prev_start = line_start(b, prev_end);
+    size_t end = prev_end;
+    if (end - prev_start > *goal)
+      end = prev_start + *goal;
+    b->cursor = end;
+  } else {
+    size_t end = line_end(b, b->cursor);
+    if (end == b->length)
+      return;
+    size_t next = end + 1, next_end = line_end(b, next);
+    b->cursor = next + ((*goal < next_end - next) ? *goal : next_end - next);
   }
-  *copy = result;
-  return 1;
 }
 
-static int save_undo(char **lines, int count, int current, char ***undo,
-                     int *undo_count, int *undo_current, int *undo_available) {
-  char **copy;
-  if (!copy_lines(lines, count, &copy))
-    return 0;
-  free_lines(*undo, *undo_count);
-  free(*undo);
-  *undo = copy;
-  *undo_count = count;
-  *undo_current = current;
-  *undo_available = 1;
-  return 1;
-}
+static void draw(const Buffer *b, const char *path, int modified,
+                 const char *message, int command, const char *cmd) {
+  struct winsize size = {0};
+  size_t cursor_start, top, cursor_row, cursor_col, pos;
+  size_t rows, cols, available_rows;
 
-static int find_next(char **lines, int count, int current, const char *query) {
-  for (int offset = 1; offset <= count; offset++) {
-    int line = (current + offset) % count;
-    if (lines[line] && strstr(lines[line], query))
-      return line;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) != 0 || !size.ws_row ||
+      !size.ws_col) {
+    size.ws_row = 24;
+    size.ws_col = 80;
   }
-  return -1;
+  rows = size.ws_row;
+  cols = size.ws_col;
+  available_rows = rows > 2 ? rows - 2 : 1;
+
+  cursor_start = line_start(b, b->cursor);
+  cursor_col = b->cursor - cursor_start;
+  top = cursor_start;
+  cursor_row = 0;
+  while (cursor_row + 1 < available_rows && top > 0) {
+    top = line_start(b, top - 1);
+    cursor_row++;
+  }
+
+  printf("\033[?25l\033[2J");
+  pos = top;
+  for (size_t row = 0; row < available_rows && pos <= b->length; row++) {
+    size_t end = line_end(b, pos);
+    size_t left =
+        row == cursor_row && cursor_col >= cols ? cursor_col - cols + 1 : 0;
+    size_t count = end > pos + left ? end - pos - left : 0;
+    if (count > cols)
+      count = cols;
+    printf("\033[%zu;1H", row + 1);
+    if (count)
+      fwrite(b->data + pos + left, 1, count, stdout);
+    printf("\033[K");
+    if (end == b->length)
+      break;
+    pos = end + 1;
+  }
+
+  printf("\033[%zu;1H\033[7m %s%s | %zu chars | %s ", rows - 1, path,
+         modified ? " [+]" : "", b->length, command ? "COMMAND" : "INSERT");
+  if (message && *message)
+    printf("| %s", message);
+  printf("\033[K\033[0m");
+  if (command) {
+    const char *command_text = cmd[0] == ':' ? cmd + 1 : cmd;
+    printf("\033[%zu;1H:%s%s\033[K", rows, ":", command_text);
+  } else {
+    size_t screen_col = cursor_col >= cols ? cols : cursor_col + 1;
+    printf("\033[%zu;%zuH", cursor_row + 1, screen_col);
+  }
+  printf("\033[?25h");
+  fflush(stdout);
 }
 
-int main(int argc, char *argv[]) {
-  int max_lines = 0, capacity = 0, line_count = 0, current_line = 0;
-  int undo_count = 0, undo_current = 0, undo_available = 0, modified = 0;
-  char *filename = NULL, *last_search = NULL;
-  char **lines = NULL, **undo_lines = NULL;
-  FILE *file;
-
+int main(int argc, char **argv) {
+  const char *path = NULL;
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-v")) {
-      printf("quecto text editor v0.08\nRepo: https://github.com/pandixproject/quecto\n");
+    if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+      printf("Usage: %s <filename>\nEscape opens command mode; :w saves, :q "
+             "quits, :wq saves and quits.\n",
+             argv[0]);
       return 0;
     }
-    if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-      print_help(argv[0]);
+    if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+      puts("quecto text editor v1.0");
       return 0;
     }
-    if (!strcmp(argv[i], "--max-lines") || !strcmp(argv[i], "-m")) {
-      const char *option = argv[i];
-      if (i + 1 >= argc || !parse_line_number(argv[i + 1], &max_lines)) {
-        printf("ERROR: %s requires a positive whole number\n", option);
-        return 1;
-      }
-      i++;
-    } else if (filename) {
-      printf("ERROR: only one filename may be provided\n");
+    if (argv[i][0] == '-') {
+      fprintf(stderr, "Unknown option: %s\n", argv[i]);
       return 1;
-    } else {
-      filename = argv[i];
     }
+    if (path) {
+      fputs("Only one filename may be provided\n", stderr);
+      return 1;
+    }
+    path = argv[i];
   }
-  if (!filename) {
-    printf("Usage: %s [options] <filename>\n", argv[0]);
+  if (!path) {
+    fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
     return 1;
   }
-  if ((file = fopen(filename, "r"))) {
-    char *line;
-    while ((line = read_dynamic_line(file))) {
-      if (!ensure_capacity(&lines, &capacity, line_count + 1, max_lines)) {
-        printf("ERROR: could not load more lines\n");
-        free(line);
-        fclose(file);
-        free_lines(lines, line_count);
-        free(lines);
-        return 1;
-      }
-      lines[line_count++] = line;
-    }
-    fclose(file);
-    current_line = line_count;
+  Buffer b = {0};
+  if (!load_file(&b, path)) {
+    perror("Could not read file");
+    free(b.data);
+    return 1;
   }
-  printf("\033[?1049h\033[2J\033[H\033[30;47m quecto text editor v0.08 \n\033[0m\n");
-  printf("Type :help for commands.\n\n");
-
-  while (1) {
-    char *raw, *cmd;
-    printf("%d%s~ ", current_line + 1, modified ? "*" : "");
-    fflush(stdout);
-    raw = read_dynamic_line(stdin);
-    if (!raw) {
-      if (modified)
-        printf("\nUnsaved changes. Use :w, :wq, or :q!\n");
-      break;
-    }
-    cmd = dup_string(raw);
-    if (!cmd) {
-      free(raw);
-      printf("ERROR: out of memory\n");
+  if (!reserve(&b, b.length + 1)) {
+    fputs("Out of memory\n", stderr);
+    free(b.data);
+    return 1;
+  }
+  struct termios original, raw;
+  if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &original) != 0) {
+    fputs("quecto needs an interactive terminal\n", stderr);
+    free(b.data);
+    return 1;
+  }
+  raw = original;
+  raw.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
+  raw.c_iflag &= (tcflag_t) ~(IXON | ICRNL);
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
+    perror("terminal setup");
+    free(b.data);
+    return 1;
+  }
+  printf("\033[?1049h");
+  int modified = 0, command = 0, quit = 0;
+  char cmd[256] = "",
+       message[256] = "Escape: command mode  |  arrows move  |  Ctrl-C exits";
+  size_t goal = (size_t)-1;
+  draw(&b, path, modified, message, command, cmd);
+  while (!quit) {
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) != 1)
       continue;
-    }
-    strip_newline(cmd);
-    if (!strcmp(cmd, ":help")) {
-      print_help(argv[0]);
-    } else if (!strcmp(cmd, ":w") || !strcmp(cmd, ":wq")) {
-      if (save_file(filename, lines, line_count)) {
-        modified = 0;
-        printf("Saved %s\n", filename);
-        if (!strcmp(cmd, ":wq")) {
-          free(cmd); free(raw); break;
-        }
-      } else printf("ERROR: could not save %s\n", filename);
-    } else if (!strcmp(cmd, ":q!")) {
-      free(cmd); free(raw); break;
-    } else if (!strcmp(cmd, ":q")) {
-      if (!modified) { free(cmd); free(raw); break; }
-      printf("You have unsaved changes. Quit without saving? (y/N) ");
-      fflush(stdout);
-      {
-        char *answer = read_dynamic_line(stdin);
-        int confirmed = answer && (!strcmp(answer, "y\n") || !strcmp(answer, "Y\n") ||
-                                   !strcmp(answer, "y") || !strcmp(answer, "Y"));
-        free(answer);
-        if (confirmed) { free(cmd); free(raw); break; }
+    message[0] = '\0';
+    if (command) {
+      size_t n = strlen(cmd);
+      if (c == 27) {
+        command = 0;
+        cmd[0] = '\0';
+      } else if (c == '\r' || c == '\n') {
+        char *name = cmd[0] == ':' ? cmd + 1 : cmd;
+        if (!strcmp(name, "w") || !strcmp(name, "wq")) {
+          if (save_file(&b, path)) {
+            modified = 0;
+            strcpy(message, "Saved");
+            if (!strcmp(name, "wq"))
+              quit = 1;
+          } else
+            snprintf(message, sizeof message, "Save failed: %s",
+                     strerror(errno));
+        } else if (!strcmp(name, "q!")) {
+          quit = 1;
+        } else if (!strcmp(name, "q")) {
+          if (modified)
+            strcpy(message, "Unsaved changes; use :q! or :wq");
+          else
+            quit = 1;
+        } else if (!strcmp(name, "help"))
+          strcpy(
+              message,
+              "Commands: :w save, :q quit, :q! force quit, :wq save and quit");
+        else if (*name)
+          strcpy(message, "Unknown command; try :help");
+        command = 0;
+        cmd[0] = '\0';
+      } else if (c == 127 || c == 8) {
+        if (n)
+          cmd[n - 1] = '\0';
+      } else if (c >= 32 && c < 127 && n < sizeof cmd - 1) {
+        cmd[n] = (char)c;
+        cmd[n + 1] = '\0';
       }
-    } else if (!strcmp(cmd, ":p")) {
-      print_line_content(lines, line_count, current_line);
-    } else if (!strncmp(cmd, ":p ", 3)) {
-      int first, last;
-      if (!parse_range(cmd + 3, &first, &last) || last > line_count) printf("ERROR: invalid line range\n");
-      else for (int i = first - 1; i < last; i++) print_line_content(lines, line_count, i);
-    } else if (!strncmp(cmd, ":g ", 3) || !strncmp(cmd, ":f ", 3)) {
-      int target;
-      if (!parse_line_number(cmd + 3, &target) || (max_lines && target > max_lines)) printf("ERROR: invalid line number\n");
-      else { current_line = target - 1; print_line_content(lines, line_count, current_line); }
-    } else if (!strcmp(cmd, ":f")) {
-      if (current_line > 0) current_line--;
-      print_line_content(lines, line_count, current_line);
-    } else if (!strncmp(cmd, ":s ", 3)) {
-      int found;
-      free(last_search);
-      last_search = dup_string(cmd + 3);
-      if (!last_search || !*last_search) { free(last_search); last_search = NULL; printf("ERROR: search text is required\n"); }
-      else if ((found = find_next(lines, line_count, current_line, last_search)) < 0) printf("Not found: %s\n", last_search);
-      else { current_line = found; print_line_content(lines, line_count, current_line); }
-    } else if (!strcmp(cmd, ":n")) {
-      int found;
-      if (!last_search) printf("ERROR: no previous search\n");
-      else if ((found = find_next(lines, line_count, current_line, last_search)) < 0) printf("Not found: %s\n", last_search);
-      else { current_line = found; print_line_content(lines, line_count, current_line); }
-    } else if (!strcmp(cmd, ":u")) {
-      if (!undo_available) printf("ERROR: nothing to undo\n");
-      else {
-        free_lines(lines, line_count); free(lines);
-        lines = undo_lines; line_count = undo_count; capacity = undo_count; current_line = undo_current;
-        undo_lines = NULL; undo_count = 0; undo_available = 0; modified = 1;
-        printf("Undid last edit\n");
-      }
-    } else if (!strcmp(cmd, ":d") || !strncmp(cmd, ":d ", 3)) {
-      int line = current_line;
-      if (cmd[2] && !parse_line_number(cmd + 3, &line)) printf("ERROR: invalid line number\n");
-      else {
-        if (cmd[2]) line--;
-        if (line < 0 || line >= line_count) printf("ERROR: no line %d to delete\n", line + 1);
-        else if (!save_undo(lines, line_count, current_line, &undo_lines, &undo_count, &undo_current, &undo_available)) printf("ERROR: could not prepare undo\n");
-        else {
-          free(lines[line]); memmove(lines + line, lines + line + 1, (size_t)(line_count - line - 1) * sizeof(*lines));
-          lines[--line_count] = NULL;
-          if (current_line > line) current_line--;
-          if (current_line > line_count) current_line = line_count;
-          modified = 1; printf("Deleted line %d\n", line + 1);
-        }
-      }
-    } else if (!strcmp(cmd, ":i") || !strncmp(cmd, ":i ", 3)) {
-      int line = current_line;
-      if (cmd[2] && !parse_line_number(cmd + 3, &line)) printf("ERROR: invalid line number\n");
-      else {
-        if (cmd[2]) line--;
-        if (line < 0 || (max_lines && line >= max_lines) || (max_lines && line_count >= max_lines)) printf("ERROR: line number out of range\n");
-        else if (!save_undo(lines, line_count, current_line, &undo_lines, &undo_count, &undo_current, &undo_available) || !ensure_capacity(&lines, &capacity, line_count + 1, max_lines)) printf("ERROR: could not insert line\n");
-        else {
-          if (line > line_count) line = line_count;
-          {
-            char *blank = dup_string("\n");
-            if (!blank) printf("ERROR: could not insert line\n");
-            else {
-              memmove(lines + line + 1, lines + line, (size_t)(line_count - line) * sizeof(*lines));
-              lines[line] = blank;
-              line_count++; current_line = line; modified = 1; printf("Inserted blank line at %d\n", line + 1);
-            }
+    } else if (c == 27) {
+      unsigned char seq[2];
+      command = 1;
+      cmd[0] = '\0';
+      fd_set input;
+      struct timeval timeout = {0, 50000};
+      FD_ZERO(&input);
+      FD_SET(STDIN_FILENO, &input);
+      if (select(STDIN_FILENO + 1, &input, NULL, NULL, &timeout) > 0 &&
+          read(STDIN_FILENO, &seq[0], 1) == 1) {
+        if (seq[0] == '[' && read(STDIN_FILENO, &seq[1], 1) == 1) {
+          if (seq[1] == 'A') {
+            move_vertical(&b, -1, &goal);
+            command = 0;
+          } else if (seq[1] == 'B') {
+            move_vertical(&b, 1, &goal);
+            command = 0;
+          } else if (seq[1] == 'C' && b.cursor < b.length) {
+            b.cursor++;
+            goal = (size_t)-1;
+            command = 0;
+          } else if (seq[1] == 'D' && b.cursor) {
+            b.cursor--;
+            goal = (size_t)-1;
+            command = 0;
           }
+        } else if (seq[0] == ':')
+          strcpy(cmd, ":");
+        else if (seq[0] >= 32 && seq[0] < 127) {
+          cmd[0] = (char)seq[0];
+          cmd[1] = '\0';
         }
       }
-    } else {
-      int required = current_line + 1, failed = 0;
-      if ((max_lines && required > max_lines) || !save_undo(lines, line_count, current_line, &undo_lines, &undo_count, &undo_current, &undo_available) || !ensure_capacity(&lines, &capacity, required, max_lines)) printf("ERROR: could not add line\n");
-      else {
-        for (int i = line_count; i < current_line; i++) if (!(lines[i] = dup_string("\n"))) { failed = 1; break; }
-        if (failed) {
-          for (int i = line_count; i < current_line; i++) { free(lines[i]); lines[i] = NULL; }
-          printf("ERROR: could not add line\n");
-        } else {
-          free(lines[current_line]); lines[current_line] = raw; raw = NULL;
-          if (required > line_count) line_count = required;
-          current_line++; modified = 1;
-        }
+    } else if (c == 3) {
+      if (!modified)
+        quit = 1;
+      else
+        strcpy(message, "Unsaved changes; use Escape then :q! or :wq");
+    } else if (c == 127 || c == 8) {
+      if (b.cursor) {
+        memmove(b.data + b.cursor - 1, b.data + b.cursor, b.length - b.cursor);
+        b.cursor--;
+        b.length--;
+        modified = 1;
       }
+      goal = (size_t)-1;
+    } else if (c == 4) {
+      if (b.cursor < b.length) {
+        memmove(b.data + b.cursor, b.data + b.cursor + 1,
+                b.length - b.cursor - 1);
+        b.length--;
+        modified = 1;
+      }
+    } else if (c == '\r' || c == '\n') {
+      if (reserve(&b, b.length + 2)) {
+        memmove(b.data + b.cursor + 1, b.data + b.cursor, b.length - b.cursor);
+        b.data[b.cursor++] = '\n';
+        b.length++;
+        modified = 1;
+      }
+      goal = (size_t)-1;
+    } else if (c >= 32 && c != 127) {
+      if (reserve(&b, b.length + 2)) {
+        memmove(b.data + b.cursor + 1, b.data + b.cursor, b.length - b.cursor);
+        b.data[b.cursor++] = (char)c;
+        b.length++;
+        modified = 1;
+      }
+      goal = (size_t)-1;
     }
-    free(cmd);
-    free(raw);
+    draw(&b, path, modified, message, command, cmd);
   }
   printf("\033[?1049l");
-  free(last_search); free_lines(lines, line_count); free(lines);
-  free_lines(undo_lines, undo_count); free(undo_lines);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &original);
+  free(b.data);
   return 0;
 }
+// Fuck yeah the code works!!! \(^o^)/
+// These 2 lines were written with quecto v1.0 btw
