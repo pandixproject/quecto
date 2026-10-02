@@ -23,10 +23,18 @@ Backspace to delete the character before the cursor, and use
 Control-D to delete the character under the cursor. Press Escape
 to enter command mode, then type a command and press Enter:
     :w      Save the file
+    :w FILE Save to FILE (also changes the current filename)
     :q      Quit if there are no unsaved changes
     :q!     Quit without saving
     :wq     Save the file and quit
-Press Escape again to return to editing.
+    :wq FILE Save to FILE and quit
+    :e FILE Open FILE (only when there are no unsaved changes)
+    :set number   Show line numbers
+    :set nonumber Hide line numbers
+    :goto N Move to line N (starting at 1)
+    :help   Show available commands
+    :help COMMAND Show help for a command
+Press Escape to return to editing.
 
   LICENSE
 Quecto is avaidable as the absolute public domain or by the
